@@ -1,0 +1,15 @@
+{
+  "name": "liturgia-api",
+  "version": "1.0.0",
+  "description": "API proxy for sagraditurgia.com.br liturgia diaria, hosted on Cloudflare Pages",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler pages dev .",
+    "deploy": "wrangler pages deploy ."
+  },
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "wrangler": "^4.162.0"
+  }
+}
