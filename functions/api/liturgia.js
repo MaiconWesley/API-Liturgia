@@ -1,193 +1,316 @@
-// Função Cloudflare Pages que processa o proxy de liturgia diária do site sagraditurgia.com.br
-// Aceita o parâmetro de data ?date=YYYY-MM-DD e retorna JSON estruturado
-// Usando apenas fetch padrão e regex – sem DOM parsing.
+// Cloudflare Pages Function — API de Liturgia Diária (fonte: liturgia.cancaonova.com)
+// Endpoint: GET /api/liturgia?date=YYYY-MM-DD
+// Retorna JSON estruturado com as leituras, salmo e evangelho do dia.
 
-export default async function(context) {
-  const {
-    request,
-    env,
-    waitUntil,
-    next,
-  } = context;
+const BASE = 'https://liturgia.cancaonova.com/pb';
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 
-  const url = new URL(request.url);
-  const dateParam = url.searchParams.get('date');
+const HTML_ENTITIES = {
+  nbsp: ' ', amp: '&', lt: '<', gt: '>', quot: '"', apos: "'",
+  aacute: 'á', eacute: 'é', iacute: 'í', oacute: 'ó', uacute: 'ú',
+  agrave: 'à', egrave: 'è', igrave: 'ì', ograve: 'ò', ugrave: 'ù',
+  acirc: 'â', ecirc: 'ê', icirc: 'î', ocirc: 'ô', ucirc: 'û',
+  atilde: 'ã', otilde: 'õ', Aacute: 'Á', Eacute: 'É', Iacute: 'Í',
+  Oacute: 'Ó', Uacute: 'Ú', Atilde: 'Ã', Otilde: 'Õ', Acirc: 'Â',
+  Ecirc: 'Ê', Ocirc: 'Ô', ccedil: 'ç', Ccedil: 'Ç',
+  laquo: '«', raquo: '»', hellip: '…', deg: 'º', ordm: 'º', ordf: 'ª',
+  ldquo: '“', rdquo: '”', lsquo: '‘', rsquo: '’', ndash: '–', mdash: '—',
+  copy: '©', reg: '®', trade: '™',
+};
 
-  // Validar formato YYYY-MM-DD
-  const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
-  if (!dateParam || !dateRegex.test(dateParam)) {
-    return new Response(
-      JSON.stringify({ error: 'Parâmetro de data ausente ou inválido. Use o formato YYYY-MM-DD (ex: 2026-11-15)' }),
-      { status: 400, headers: { 'content-type': 'application/json' } },
-    );
-  }
-
-  // Construir a URL do site de origem
-  const sourceUrl = `https://sagradaliturgia.com.br/liturgia_diaria.php?date=${dateParam}`;
-
-  let html;
-  try {
-    const response = await fetch(sourceUrl);
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status} ${response.statusText}`);
-    }
-    html = await response.text();
-  } catch (e) {
-    return new Response(
-      JSON.stringify({ error: 'Falha ao buscar a página de liturgia', details: e.message }),
-      { status: 502, headers: { 'content-type': 'application/json' } },
-    );
-  }
-
-  // Parsear HTML com regex para extrair seções estrutur volatiles
-  const parsed = parseLiturgyHtml(html, dateParam);
-
-  // Cache opcional: usando waitUntil para Workers KV ou Cloudflare Cache API se necessário
-
-  return new Response(JSON.stringify(parsed, null, 2), {
-    headers: {
-      'content-type': 'application/json; charset=utf-8',
-      'cache-control': 'public, max-age=60, stale-while-revalidate=300', // cache por 1 minuto + revalidação
-    },
-  });
+function decodeEntities(text) {
+  return text
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10)))
+    .replace(/&([a-zA-Z]+);/g, (_, name) => (HTML_ENTITIES[name] !== undefined ? HTML_ENTITIES[name] : `&${name};`));
 }
 
-function parseLiturgyHtml(html, dateParam) {
-  // Utiliza regex para extrair seções-chave
+function normalizeText(text) {
+  return decodeEntities(text).replace(/\s+/g, ' ').trim();
+}
+
+// Converte o HTML de uma seção em linhas de texto limpo.
+function sectionToLines(sectionHtml) {
+  let txt = sectionHtml
+    .replace(/<iframe[\s\S]*?<\/iframe>/gi, ' ') // áudio embutido
+    .replace(/<\/p>/gi, '\n')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ');
+  txt = decodeEntities(txt);
+  return txt
+    .split('\n')
+    .map((l) => l.replace(/\s+/g, ' ').trim())
+    .filter((l) => l.length > 0);
+}
+
+// Separa as linhas de uma seção em intro / alleluia / proclamation / text.
+// O campo "text" contém todo o texto restante (incluindo respostas "- Palavra do Senhor" etc.).
+function splitReadingLines(lines, num) {
+  const out = { intro: null, alleluia: null, proclamation: null, text: [] };
+  let i = 0;
+
+  // Pula a linha de cabeçalho (ex: "Primeira Leitura (Pr 31,10-13...)")
+  if (i < lines.length && /^(Primeira Leitura|Segunda Leitura|Responsório|Evangelho)\b/.test(lines[i])) {
+    i++;
+  }
+
+  // Linha de introdução: "Leitura do ..." / "Responsório Sl ..."
+  if (i < lines.length && /^(Leitura|Responsório)/.test(lines[i])) {
+    out.intro = lines[i];
+    i++;
+  }
+
+  // No evangelho: Aleluia + versículo da aclamação + proclamação
+  if (num === '4' && i < lines.length && /^- Aleluia/.test(lines[i])) {
+    const acc = [lines[i]];
+    i++;
+    if (i < lines.length && /^- /.test(lines[i])) {
+      acc.push(lines[i]);
+      i++;
+    }
+    out.alleluia = acc.join('\n');
+    if (i < lines.length && /^Proclamação/.test(lines[i])) {
+      out.proclamation = lines[i];
+      i++;
+    }
+  }
+
+  for (; i < lines.length; i++) {
+    const line = lines[i];
+    if (/Conferência Nacional dos Bispos|Todos os direitos reservados/.test(line)) continue;
+    out.text.push(line);
+  }
+
+  return out;
+}
+
+// Resolve o slug da liturgia para uma data usando o calendário do mês.
+async function resolveSlug(dateStr, waitUntil) {
+  const [y, m] = dateStr.split('-').map(Number);
+  const calUrl = `${BASE}/liturgia/?sDia=1&sMes=${m}&sAno=${y}`;
+
+  const cache = caches.default;
+  const cachedCal = await cache.match(calUrl);
+  let html;
+  if (cachedCal) {
+    html = await cachedCal.text();
+  } else {
+    const res = await fetch(calUrl, { headers: { 'user-agent': UA } });
+    if (!res.ok) throw new Error(`calendário HTTP ${res.status}`);
+    html = await res.text();
+    const respToCache = new Response(html, { headers: { 'cache-control': 'public, max-age=86400' } });
+    if (waitUntil) waitUntil(cache.put(calUrl, respToCache));
+  }
+
+  const linkRe = /<a\s+href="(https:\/\/liturgia\.cancaonova\.com\/pb\/liturgia\/([a-z0-9-]+)\/\?sDia=(\d+)&sMes=(\d+)&sAno=(\d+))"[^>]*>\s*\d+\s*<\/a>/g;
+  let match;
+  while ((match = linkRe.exec(html)) !== null) {
+    const slug = match[2];
+    const day = String(match[3]).padStart(2, '0');
+    const month = String(match[4]).padStart(2, '0');
+    const year = match[5];
+    if (`${year}-${month}-${day}` === dateStr) {
+      return slug;
+    }
+  }
+  return null;
+}
+
+function parseContentPage(html, dateStr, pageUrl) {
   const result = {
-    date: dateParam,
-    source_url: `https://sagradaliturgia.com.br/liturgia_diaria.php?date=${dateParam}`,
+    date: dateStr,
+    source_url: pageUrl,
     weekday: null,
-    day_of_month: null,
+    day: null,
     month: null,
     year: null,
     liturgy_color: null,
-    time: null, // ex: 33o. Domingo do Tempo Comum, ou Tempo Natal, Solenidade
-    gospel_reference: null,
+    title: null,
     first_reading: null,
     psalm: null,
     second_reading: null,
     gospel: null,
-    commentary: null,
   };
 
-  // Extrair título do dia: <b>Domingo, 15 de Novembro de 2026</b>
-  const titleMatch = html.match(/<b>([^<]+),\s*(\d+)\s+de\s+([^<]+)\s+de\s+(\d+)<\/b>/);
-  if (titleMatch) {
-    result.weekday = titleMatch[1].trim(); // Domingo
-    result.day_of_month = parseInt(titleMatch[2], 10); // 15
-    result.month = titleMatch[3].trim(); // Novembro
-    result.year = parseInt(titleMatch[4], 10); // 2026
+  // Título litúrgico
+  const h1 = html.match(/<h1 class="entry-title">([\s\S]*?)<\/h1>/);
+  if (h1) result.title = normalizeText(h1[1]);
+
+  // Data exibida no site
+  const dia = html.match(/<span class='dia'>(\d+)<\/span>/);
+  const mes = html.match(/<span class='mes'>([^<]+)<\/span>/);
+  const ano = html.match(/<span class='ano'>(\d+)<\/span>/);
+  if (dia) result.day = parseInt(dia[1], 10);
+  if (mes) result.month = mes[1].trim();
+  if (ano) result.year = parseInt(ano[1], 10);
+
+  // Cor litúrgica
+  const color = html.match(/Cor Litúrgica:\s*([^<\n]+)/);
+  if (color) result.liturgy_color = color[1].trim();
+
+  // Nome do dia da semana calculado a partir da data
+  const [yy, mm, dd] = dateStr.split('-').map(Number);
+  const d = new Date(Date.UTC(yy, mm - 1, dd));
+  const weekdays = ['Domingo', 'Segunda-feira', 'Terça-feira', 'Quarta-feira', 'Quinta-feira', 'Sexta-feira', 'Sábado'];
+  result.weekday = weekdays[d.getUTCDay()];
+
+  // Referências do menu de abas
+  const refs = {};
+  const navRe = /<a id="lit-(\d)"[^>]*href="#liturgia-\d">\s*<label class="liturgia tipo-titulo">([^<]+)<\/label>\s*<div class="referencia">([^<]+)<\/div>/g;
+  let nm;
+  while ((nm = navRe.exec(html)) !== null) {
+    refs[nm[1]] = { label: nm[2].trim(), reference: nm[3].trim() };
   }
 
-  // Extrair cor da imagem: <img src="https://sagradaliturgia.com.br/images/verde.png" width="140"/>
-  const colorMatch = html.match(/<img[^>]*src=["']https:\/\/sagradaliturgia\.com\.br\/images\/([^"\'>]+)["'][^>]*>/);
-  if (colorMatch) {
-    result.liturgy_color = colorMatch[1]; // verde.png, branco.png, etc.
+  // Seções de conteúdo
+  const secRe = /<div id="liturgia-(\d)" class="tab-pane[^"]*">/g;
+  const sections = [];
+  let sm;
+  while ((sm = secRe.exec(html)) !== null) {
+    sections.push({ num: sm[1], start: sm.index + sm[0].length });
   }
 
-  // Extrair tempo / solenidade após a imagem: <br><br>33o. Domingo do Tempo Comum</center><hr>
-  const timeMatch = html.match(/<center><b>.*?<\/b><br><br>(.*?)<\/center><hr>/);
-  if (timeMatch && timeMatch[1]) {
-    result.time = timeMatch[1].trim();
-  } else {
-    // Fallback: tentar extrair após imagem e antes de <hr>
-    const altTimeMatch = html.match(/<img[^>]*>[\s\S]*?<hr>\s*([^\n\r]*?)<\/b>/);
-    if (altTimeMatch && altTimeMatch[1]) {
-      result.time = altTimeMatch[1].trim();
-    }
-  }
+  const articleEnd = html.indexOf('</article>');
 
-  // Evangelho do dia: <b>Evangelho do dia: São Mateus 25, 14-30</b>
-  const gospelRefMatch = html.match(/<b>Evangelho do dia:\s*([^<]+)<\/b>/);
-  if (gospelRefMatch && gospelRefMatch[1]) {
-    result.gospel_reference = gospelRefMatch[1].trim();
-  }
+  for (let i = 0; i < sections.length; i++) {
+    const sec = sections[i];
+    const nextStart = i + 1 < sections.length ? sections[i + 1].start : articleEnd !== -1 ? articleEnd : html.length;
+    const bodyHtml = html.substring(sec.start, nextStart);
+    const lines = sectionToLines(bodyHtml);
+    const meta = refs[sec.num] || { label: null, reference: null };
+    const parts = splitReadingLines(lines, sec.num);
 
-  // Primeira leitura: <b>Primeira leitura: Provérbios 31, 10-13.19-20.30-31</b>
-  const firstReadRefMatch = html.match(/<b>Primeira leitura:\s*([^<]+)<\/b>/);
-  if (firstReadRefMatch && firstReadRefMatch[1]) {
-    const refText = firstReadRefMatch[1].trim();
-    result.first_reading = { reference: refText, text: null, label: null };
-    // Extrair o rótulo: Leitura do Livro dos Provérbios:
-    const labelMatch = html.match(/<b>Primeira leitura:[^<]*<\/b>\s*([^\n]*Leitura do Livro [^<]+):/);
-    if (labelMatch && labelMatch[1]) {
-      result.first_reading.label = labelMatch[1].trim();
-    } else {
-      result.first_reading.label = 'Leitura do Livro dos Provérbios:';
-    }
-    // Extrair texto da primeira leitura até <br><br> próximo? Pode ser complexo; para simplificar, extrair após o <b>Primeira leitura</b> até o próximo <b>Salmo</b> (ou semelhante)
-    const firstReadStartIdx = html.indexOf('<b>Primeira leitura:');
-    const firstReadEndIdx = html.indexOf('<b>Salmo', firstReadStartIdx);
-    if (firstReadEndIdx !== -1) {
-      const firstReadHtml = html.substring(firstReadStartIdx, firstReadEndIdx);
-      // Remover todas as tags <b>, <br>, <br> para texto puro
-      const cleaned = firstReadHtml.replace(/<\/?b>/g, '').replace(/<br\s*\/>/g, '\n\n').replace(/&nbsp;/g, ' ');
-      // Remover possíveis rótulos extras e etiquetas
-      result.first_reading.text = cleaned.trim();
-    }
-  }
+    const entry = {
+      label: meta.label,
+      reference: meta.reference,
+      intro: parts.intro,
+      text: parts.text.join('\n'),
+    };
+    if (parts.alleluia) entry.alleluia = parts.alleluia;
+    if (parts.proclamation) entry.proclamation = parts.proclamation;
 
-  // Salmo: <b>Salmo 127 (128)</b><br>... texto com <br> para linhas. Pode incluir os rótulos R:
-  const psalmStart = html.indexOf('<b>Salmo');
-  const psalmEnd = html.indexOf('<b>Segunda leitura', psalmStart);
-  if (psalmStart !== -1 && psalmEnd !== -1) {
-    const psalmHtml = html.substring(psalmStart, psalmEnd);
-    // Extrair referência dentro de <b>Salmo ...</b>
-    const psalmRefMatch = psalmHtml.match(/<b>(Salmo [^<]+)<\/b>/);
-    const psalmRef = psalmRefMatch ? psalmRefMatch[1].trim() : null;
-    // Remover <b>Salmo ...</b> e <br> para texto plano
-    let psalmText = psalmHtml.replace(/<\/?b>/g, '').replace(/<br\s*\/>/g, '\n').replace(/&nbsp;/g, ' ');
-    // Remover rótulo extra: 'Salmo 127 (128)' já está em result.first_reading? Na verdade, esta é a referência do salmo; mantemos o rótulo R:
-    result.psalm = { reference: psalmRef, text: psalmText.trim() };
-  }
-
-  // Segunda leitura: <b>Segunda leitura: Tessalonicenses 5, 1-6</b> ... etc.
-  const secondReadStart = html.indexOf('<b>Segunda leitura:');
-  const gospelStart = html.indexOf('<b>Evangelho de Jesus Cristo', secondReadStart);
-  if (secondReadStart !== -1 && gospelStart !== -1) {
-    const secondReadHtml = html.substring(secondReadStart, gospelStart);
-    const secondReadRefMatch = secondReadHtml.match(/<b>Segunda leitura:\s*([^<]+)<\/b>/);
-    const secondReadRef = secondReadRefMatch ? secondReadRefMatch[1].trim() : null;
-    // Extrair o rótulo: Leitura da Primeira Carta de São Paulo aos Tessalonicenses:
-    const labelMatch = secondReadHtml.match(/<b>Segunda leitura:[^<]*<\/b>\s*([^\n]*Leitura da [^<]+):/);
-    let label = 'Leitura da Primeira Carta de São Paulo aos Tessalonicenses:';
-    if (labelMatch && labelMatch[1]) label = labelMatch[1].trim();
-    // Texto: remover tags <b>, <br>
-    let secondReadText = secondReadHtml.replace(/<\/?b>/g, '').replace(/<br\s*\/>/g, '\n\n').replace(/&nbsp;/g, ' ');
-    result.second_reading = { reference: secondReadRef, text: secondReadText.trim(), label: label };
-  }
-
-  // Evangelho (conteúdo completo): pode ter <b>Evangelho de Jesus Cristo segundo São Mateus 25, 14-30</b> e várias partes (Aleluia, Proclamação, etc.)
-  const fullGospelStart = html.indexOf('<b>Evangelho de Jesus Cristo');
-  const commentaryStart = html.indexOf('<b>Comentário do dia', fullGospelStart);
-  if (fullGospelStart !== -1 && commentaryStart !== -1) {
-    const gospelHtml = html.substring(fullGospelStart, commentaryStart);
-    // Extrair a referência: <b>Evangelho de Jesus Cristo segundo São Mateus 25, 14-30</b>
-    const gospelRefMatch = gospelHtml.match(/<b>Evangelho de Jesus Cristo segundo ([^<]+)<\/b>/);
-    const gospelRef = gospelRefMatch ? `${gospelRefMatch[1].trim()}` : null;
-    // Se não houver referência, tentar extrair com Evangelho de Jesus Cristo... mas manter simples.
-    // O texto do evangelho contém <b> Aleluia, Aleluia, Aleluia! </b> etc. Extrair todo o texto, mas precisamos de texto plano.
-    let gospelText = gospelHtml.replace(/<\/?b>/g, '').replace(/<br\s*\/>/g, '\n\n').replace(/&nbsp;/g, ' ');
-    // Remover espaços extras e limpar
-    gospelText = gospelText.replace(/\n{3,}/g, '\n\n');
-    result.gospel = { reference: gospelRef, text: gospelText.trim() };
-  }
-
-  // Comentário: <b>Comentário do dia por São João Crisóstomo</b> ... Presbítero de Antioquia... texto ...
-  const commentStart = html.indexOf('<b>Comentário do dia');
-  if (commentStart !== -1) {
-    const commentHtml = html.substring(commentStart);
-    const commentRefMatch = commentHtml.match(/<b>Comentário do dia por ([^<]+)<\/b>/);
-    const author = commentRefMatch ? commentRefMatch[1].trim() : null;
-    // Extrair fonte: Presbítero de Antioquia, Bispo de Constantinopla, Doutor da Igreja<br>Homilias sobre o Evangelho de São Mateus, n.º 78, 2-3
-    const sourceMatch = commentHtml.match(/Presb&iacute;tero de Antioquia.*?Homilias sobre o Evangelho de S&atilde;o Mateus[^<]*<\/b>/);
-    const source = sourceMatch ? sourceMatch[0].replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g, ' ').trim() : null;
-    // Remover todas as tags HTML para texto simples
-    let commentText = commentHtml.replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g, ' ');
-    commentText = commentText.replace(/\s{2,}/g, ' ').trim();
-    result.commentary = { author, source, text: commentText };
+    if (sec.num === '1') result.first_reading = entry;
+    else if (sec.num === '2') result.psalm = entry;
+    else if (sec.num === '3') result.second_reading = entry;
+    else if (sec.num === '4') result.gospel = entry;
   }
 
   return result;
+}
+
+export async function onRequest(context) {
+  const { request } = context;
+
+  // Preflight CORS
+  if (request.method === 'OPTIONS') {
+    return new Response(null, {
+      status: 204,
+      headers: {
+        'access-control-allow-origin': '*',
+        'access-control-allow-methods': 'GET, OPTIONS',
+        'access-control-allow-headers': 'content-type',
+      },
+    });
+  }
+
+  if (request.method !== 'GET') {
+    return new Response(JSON.stringify({ error: 'Método não permitido. Use GET.' }), {
+      status: 405,
+      headers: { 'content-type': 'application/json', 'access-control-allow-origin': '*' },
+    });
+  }
+
+  return handleRequest(context);
+}
+
+async function handleRequest(context) {
+  const { request, waitUntil } = context;
+
+  const url = new URL(request.url);
+
+  const corsHeaders = {
+    'access-control-allow-origin': '*',
+    'access-control-allow-methods': 'GET, OPTIONS',
+    'access-control-allow-headers': 'content-type',
+  };
+
+  if (request.method === 'OPTIONS') {
+    return new Response(null, { status: 204, headers: corsHeaders });
+  }
+
+  if (request.method !== 'GET') {
+    return new Response(JSON.stringify({ error: 'Método não permitido. Use GET.' }), {
+      status: 405,
+      headers: { 'content-type': 'application/json', ...corsHeaders },
+    });
+  }
+
+  const dateParam = url.searchParams.get('date');
+  const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+  if (!dateParam || !dateRegex.test(dateParam)) {
+    return new Response(
+      JSON.stringify({ error: 'Parâmetro "date" ausente ou inválido. Use o formato YYYY-MM-DD. Exemplo: /api/liturgia?date=2026-11-15' }),
+      { status: 400, headers: { 'content-type': 'application/json', ...corsHeaders } },
+    );
+  }
+
+  // Valida se a data realmente existe
+  const [yy, mm, dd] = dateParam.split('-').map(Number);
+  const check = new Date(Date.UTC(yy, mm - 1, dd));
+  if (check.getUTCFullYear() !== yy || check.getUTCMonth() !== mm - 1 || check.getUTCDate() !== dd) {
+    return new Response(JSON.stringify({ error: 'Data inválida (ex: 2026-02-30 não existe).' }), {
+      status: 400,
+      headers: { 'content-type': 'application/json', ...corsHeaders },
+    });
+  }
+
+  const cacheKey = new Request(`${url.origin}/api/liturgia?date=${dateParam}`, request);
+  const cache = caches.default;
+  const cached = await cache.match(cacheKey);
+  if (cached) return cached;
+
+  let slug;
+  try {
+    slug = await resolveSlug(dateParam, waitUntil);
+  } catch (e) {
+    return new Response(JSON.stringify({ error: 'Falha ao buscar o calendário litúrgico', details: e.message }), {
+      status: 502,
+      headers: { 'content-type': 'application/json', ...corsHeaders },
+    });
+  }
+
+  if (!slug) {
+    return new Response(JSON.stringify({ error: 'Liturgia não encontrada para a data informada.', date: dateParam }), {
+      status: 404,
+      headers: { 'content-type': 'application/json', ...corsHeaders },
+    });
+  }
+
+  const pageUrl = `${BASE}/liturgia/${slug}/?sDia=${dd}&sMes=${mm}&sAno=${yy}`;
+
+  let html;
+  try {
+    const pageRes = await fetch(pageUrl, { headers: { 'user-agent': UA } });
+    if (!pageRes.ok) throw new Error(`HTTP ${pageRes.status}`);
+    html = await pageRes.text();
+  } catch (e) {
+    return new Response(JSON.stringify({ error: 'Falha ao buscar a página da liturgia', details: e.message }), {
+      status: 502,
+      headers: { 'content-type': 'application/json', ...corsHeaders },
+    });
+  }
+
+  const parsed = parseContentPage(html, dateParam, pageUrl);
+
+  const response = new Response(JSON.stringify(parsed, null, 2), {
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'public, max-age=3600, stale-while-revalidate=86400',
+      ...corsHeaders,
+    },
+  });
+
+  waitUntil?.(cache.put(cacheKey, response.clone()));
+
+  return response;
 }
