@@ -101,6 +101,29 @@ wrangler login
 wrangler pages deploy .
 ```
 
+## Deploy como Worker (workers.dev)
+
+Se o seu domínio é `*.workers.dev` (ex: `api-liturgia.mwm-maicon.workers.dev`), o projeto precisa ser publicado como **Worker**, não como Pages. Para isso o repositório já inclui:
+
+- `src/index.js` — entry point do Worker (reaproveita a mesma lógica da Pages Function)
+- `wrangler.worker.toml` — configuração com o nome do Worker
+- script `npm run deploy:worker`
+
+Basta rodar:
+
+```bash
+npx wrangler login          # autentica na sua conta Cloudflare (uma vez)
+npm run deploy:worker       # publica o Worker "api-liturgia"
+```
+
+Depois, a API fica em:
+
+```
+https://api-liturgia.mwm-maicon.workers.dev/api/liturgia?date=2026-11-15
+```
+
+> **Pages vs Workers:** `functions/` é usado pelo **Cloudflare Pages** (URL `*.pages.dev`). Para o domínio `*.workers.dev`, use o entry point Worker acima. O código da API é exatamente o mesmo nos dois.
+
 ## Exemplo de uso
 
 ```bash

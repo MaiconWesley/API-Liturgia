@@ -223,7 +223,7 @@ export async function onRequest(context) {
   return handleRequest(context);
 }
 
-async function handleRequest(context) {
+export async function handleRequest(context) {
   const { request, waitUntil } = context;
 
   const url = new URL(request.url);

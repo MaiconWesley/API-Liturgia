@@ -1,0 +1,6 @@
+# Configuração alternativa para deploy como WORKER (workers.dev).
+# Uso: npm run deploy:worker
+# (O deploy em Cloudflare Pages continua usando a pasta functions/ e não este arquivo.)
+name = "api-liturgia"
+main = "src/index.js"
+compatibility_date = "2026-11-13"
